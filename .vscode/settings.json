@@ -1,3 +1,9 @@
 {
-  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe"
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.analysis.extraPaths": [
+    "./Self-Healing-RAG/app"
+  ],
+  "python.autoComplete.extraPaths": [
+    "./Self-Healing-RAG/app"
+  ]
 }
