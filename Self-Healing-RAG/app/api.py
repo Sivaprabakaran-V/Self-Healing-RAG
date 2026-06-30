@@ -180,6 +180,33 @@ async def ask_question(request: QuestionRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal RAG processing error."
         )
+@app.post("/garak")
+async def garak_endpoint(payload: dict):
+    """
+    Dedicated endpoint for Garak security scanning.
+    Exposes RAG query generation using standard dictionary payload structure.
+    """
+    if rag_instance is None:
+        logger.error("RAG system was not initialized properly on startup.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal RAG processing error."
+        )
+
+    prompt = payload.get("prompt", "")
+    logger.info(f"Garak scan query received: '{prompt}'")
+    
+    try:
+        result = rag_instance.ask(prompt)
+        return {
+            "response": result["answer"]
+        }
+    except Exception as e:
+        logger.error(f"Error during Garak security scanning query: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal RAG processing error."
+        )
 
 
 if __name__ == "__main__":

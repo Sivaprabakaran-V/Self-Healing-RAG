@@ -13,3 +13,8 @@ wheels/
 scratch_chroma_db
 
 
+# Chroma Vector DB & Documents
+Self-Healing-RAG/Vector_DB/
+
+
+
