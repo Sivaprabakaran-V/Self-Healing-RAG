@@ -21,6 +21,9 @@ from langchain_groq import ChatGroq
 from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 
+# Critic Agent Imports
+from critic import CriticAgent
+
 # Configure logging format
 logging.basicConfig(
     level=logging.INFO,
@@ -99,7 +102,10 @@ class SelfHealingRAG:
             temperature=0.0
         )
 
-        # 6. Auto build/update vector store on startup
+        # 6. Initialize Critic Agent
+        self.critic = CriticAgent(llm=self.llm)
+
+        # 7. Auto build/update vector store on startup
         self.build_or_update_vectorstore()
         logger.info("Self-Healing RAG initialization complete.")
 
@@ -619,39 +625,60 @@ class SelfHealingRAG:
         # Verify answer validation triggers
         if not docs or not filtered_docs:
             logger.warning("No documents retrieved or all chunks are below the relevance threshold.")
+            critic_res = self.critic.evaluate(question, "", fallback_answer)
             return {
                 "question": question,
                 "answer": fallback_answer,
                 "sources": [],
-                "retrieved_chunks": 0
+                "retrieved_chunks": 0,
+                "critic_evaluation": critic_res
             }
 
         context_text = "\n\n".join(doc.page_content for doc in filtered_docs)
         if not context_text.strip():
             logger.warning("Retrieved context content is empty.")
+            critic_res = self.critic.evaluate(question, "", fallback_answer)
             return {
                 "question": question,
                 "answer": fallback_answer,
                 "sources": [],
-                "retrieved_chunks": 0
+                "retrieved_chunks": 0,
+                "critic_evaluation": critic_res
             }
 
         # 3. Generate response using LLM
         try:
             answer = self.generate_answer(question, context_text)
+            
+            # 4. Evaluate generated response using Critic Agent
+            critic_res = self.critic.evaluate(question, context_text, answer)
+            
             return {
                 "question": question,
                 "answer": answer,
                 "sources": sorted(list(filtered_sources)),
-                "retrieved_chunks": len(filtered_docs)
+                "retrieved_chunks": len(filtered_docs),
+                "critic_evaluation": critic_res
             }
         except Exception as e:
             logger.error(f"Error handling LLM invocation: {e}")
+            # Map exception fallback to Critic failing criteria
+            fallback_critic = {
+                "grounded": False,
+                "relevant": False,
+                "complete": False,
+                "hallucination": False,
+                "prompt_injection": False,
+                "confidence": 0.0,
+                "decision": "FAIL",
+                "reason": f"Generation failed due to error: {e}"
+            }
             return {
                 "question": question,
                 "answer": fallback_answer,
                 "sources": [],
-                "retrieved_chunks": 0
+                "retrieved_chunks": 0,
+                "critic_evaluation": fallback_critic
             }
 
 

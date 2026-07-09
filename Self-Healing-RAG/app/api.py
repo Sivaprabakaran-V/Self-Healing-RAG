@@ -158,14 +158,19 @@ async def ask_question(request: QuestionRequest):
     
     try:
         # Query the RAG workflow
-        # TODO: Self-Healing Retry (future layer for query/retrieval retries)
-        # TODO: Critic Agent (future output verification & evaluation)
         result = rag_instance.ask(request.question)
         
-        # TODO: Garak Metrics Collection (future security evaluation logging)
-        
+        # Evaluate decision from Critic Agent
+        critic_eval = result.get("critic_evaluation")
+        if critic_eval and critic_eval.get("decision") == "FAIL":
+            logger.warning(f"Critic Agent rejected response with FAIL. Returning evaluation JSON.")
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=critic_eval
+            )
+            
         processing_time = time.time() - start_time
-        logger.info(f"Response generated successfully in {processing_time:.2f}s.")
+        logger.info(f"Response generated and passed Critic in {processing_time:.2f}s.")
         
         return QuestionResponse(
             question=result["question"],
@@ -198,6 +203,15 @@ async def garak_endpoint(payload: dict):
     
     try:
         result = rag_instance.ask(prompt)
+        
+        critic_eval = result.get("critic_evaluation")
+        if critic_eval and critic_eval.get("decision") == "FAIL":
+            logger.warning(f"Critic Agent rejected response during Garak probe with FAIL. Returning evaluation JSON.")
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=critic_eval
+            )
+            
         return {
             "response": result["answer"]
         }
