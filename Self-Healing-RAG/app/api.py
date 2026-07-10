@@ -1,7 +1,7 @@
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -52,8 +52,8 @@ async def lifespan(app: FastAPI):
 # Create FastAPI application
 app = FastAPI(
     title="Self-Healing RAG API",
-    description="Production FastAPI wrapper for the Self-Healing RAG Security Assessment Platform.",
-    version="1.0.0",
+    description="Production FastAPI wrapper for the Self-Healing RAG Security Assessment Platform — V3 with Healing Controller.",
+    version="3.0.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc"
@@ -69,7 +69,9 @@ app.add_middleware(
 )
 
 
-# --- Request and Response Schemas ---
+# ---------------------------------------------------------------------------
+# Request and Response Schemas (V3 Enriched Envelope)
+# ---------------------------------------------------------------------------
 
 class QuestionRequest(BaseModel):
     """Schema representing an incoming question query."""
@@ -81,20 +83,85 @@ class QuestionRequest(BaseModel):
         """Enforces whitespace stripping and rejects empty questions."""
         if not isinstance(v, str):
             raise ValueError("Question must be a string.")
-        
         v_stripped = v.strip()
         if len(v_stripped) < 1:
             raise ValueError("Question cannot be empty.")
-            
         return v_stripped
 
 
-class QuestionResponse(BaseModel):
-    """Schema representing the RAG query response."""
-    question: str = Field(..., description="The original question query.")
-    answer: str = Field(..., description="The generated response text from the document context.")
-    sources: list[str] = Field(..., description="The file sources from which content was retrieved.")
-    retrieved_chunks: int = Field(..., description="The number of retrieved text chunks that met the relevance threshold.")
+class CriticSummary(BaseModel):
+    """Critic evaluation summary exposed in the API response.
+    
+    Exposes only scores and the final decision — never internal prompts
+    or chain-of-thought reasoning produced by the LLM.
+    """
+    decision: Optional[str] = Field(None, description="PASS or FAIL.")
+    failure_reason: Optional[str] = Field(None, description="Machine-readable failure reason.")
+    grounded_score: Optional[float] = Field(None, description="Groundedness confidence score (0-1).")
+    relevance_score: Optional[float] = Field(None, description="Relevance confidence score (0-1).")
+    hallucination_score: Optional[float] = Field(None, description="Hallucination confidence score (0-1).")
+    overall_confidence: Optional[float] = Field(None, description="Overall reliability score (0-1).")
+    reason: Optional[str] = Field(None, description="Human-readable evaluation summary.")
+
+
+class HealingAttemptInfo(BaseModel):
+    """Record of a single healing retry attempt."""
+    attempt_number: int = Field(..., description="1-indexed attempt number.")
+    strategy: str = Field(..., description="Healing strategy applied.")
+    failure_reason: str = Field(..., description="Critic failure reason that triggered this attempt.")
+    retrieval_k: int = Field(..., description="Number of documents retrieved during this attempt.")
+    outcome: str = Field(..., description="PASS, FAIL, EXHAUSTED, or SAFE_FAILURE.")
+    execution_time_s: float = Field(..., description="Wall-clock time for this attempt in seconds.")
+
+
+class HealingInfo(BaseModel):
+    """Healing Controller execution summary."""
+    healing_attempted: bool = Field(..., description="Whether healing was attempted.")
+    final_strategy: Optional[str] = Field(None, description="Last healing strategy applied.")
+    healing_strategy: Optional[str] = Field(None, description="Last healing strategy applied.")
+    retry_count: int = Field(0, description="Total healing retries executed.")
+    initial_failure_reason: str = Field("", description="Initial failure reason.")
+    healing_success: bool = Field(False, description="Whether healing was successful.")
+    attempts: list[HealingAttemptInfo] = Field(default_factory=list, description="All attempt records.")
+
+
+class MetadataInfo(BaseModel):
+    """Execution timing metadata."""
+    total_time_s: float = Field(..., description="Total wall-clock time for the request in seconds.")
+    healing_time_s: float = Field(0.0, description="Time spent inside the HealingController in seconds.")
+
+
+class EnrichedResponse(BaseModel):
+    """
+    V3 enriched response envelope returned by POST /ask.
+
+    Includes the final answer, pipeline status, critic evaluation summary,
+    healing metadata, and timing information. Internal prompts and
+    chain-of-thought are never included.
+    """
+    question: str = Field(..., description="The original user question.")
+    answer: str = Field(..., description="The final generated answer.")
+    status: Literal["PASS", "HEALED", "FAIL"] = Field(
+        ...,
+        description=(
+            "PASS = answer passed Critic on first attempt; "
+            "HEALED = answer passed after healing retries; "
+            "FAIL = all retries exhausted or unrecoverable failure."
+        ),
+    )
+    sources: list[str] = Field(..., description="Source files contributing to the answer.")
+    retrieved_chunks: int = Field(..., description="Number of context chunks used.")
+    critic_evaluation: CriticSummary = Field(..., description="Critic evaluation summary.")
+    healing: HealingInfo = Field(..., description="Healing Controller execution details.")
+    metadata: MetadataInfo = Field(..., description="Execution timing metadata.")
+    
+    # Root level fields (Issue 5)
+    healing_attempted: bool = Field(..., description="Whether healing was attempted.")
+    healing_strategy: Optional[str] = Field(None, description="Last healing strategy applied.")
+    retry_count: int = Field(0, description="Total healing retries executed.")
+    initial_failure_reason: str = Field(..., description="Initial failure reason.")
+    final_decision: str = Field(..., description="Final decision PASS or FAIL.")
+    healing_success: bool = Field(..., description="Whether healing was successful.")
 
 
 # --- Exception Handlers ---
@@ -139,10 +206,14 @@ async def health_check():
     }
 
 
-@app.post("/ask", response_model=QuestionResponse, status_code=status.HTTP_200_OK)
+@app.post("/ask", response_model=EnrichedResponse, status_code=status.HTTP_200_OK)
 async def ask_question(request: QuestionRequest):
     """
-    Main endpoint for asking questions. Integrates with the Self-Healing RAG.
+    Main endpoint for asking questions. Integrates with the V3 Self-Healing RAG.
+
+    Returns an enriched response envelope with the final answer, pipeline status
+    (PASS / HEALED / FAIL), Critic evaluation summary, healing attempt records,
+    and execution timing. Internal prompts are never exposed.
     """
     if rag_instance is None:
         logger.error("RAG system was not initialized properly on startup.")
@@ -154,33 +225,55 @@ async def ask_question(request: QuestionRequest):
     logger.info(f"Received question: {request.question}")
     start_time = time.time()
 
-    # TODO: Guardrails (future validation of input query)
-    
     try:
-        # Query the RAG workflow
         result = rag_instance.ask(request.question)
-        
-        # Evaluate decision from Critic Agent
-        critic_eval = result.get("critic_evaluation")
-        if critic_eval and critic_eval.get("decision") == "FAIL":
-            logger.warning(f"Critic Agent rejected response with FAIL. Returning evaluation JSON.")
-            return JSONResponse(
-                status_code=status.HTTP_200_OK,
-                content=critic_eval
-            )
-            
+
         processing_time = time.time() - start_time
-        logger.info(f"Response generated and passed Critic in {processing_time:.2f}s.")
-        
-        return QuestionResponse(
+        logger.info(
+            "Request completed in %.2fs — status=%s",
+            processing_time,
+            result.get("status", "UNKNOWN"),
+        )
+
+        return EnrichedResponse(
             question=result["question"],
             answer=result["answer"],
-            sources=result["sources"],
-            retrieved_chunks=result["retrieved_chunks"]
+            status=result.get("status", "FAIL"),
+            sources=result.get("sources", []),
+            retrieved_chunks=result.get("retrieved_chunks", 0),
+            critic_evaluation=CriticSummary(
+                **result.get("critic_evaluation", {})
+            ),
+            healing=HealingInfo(
+                healing_attempted=result.get("healing", {}).get("healing_attempted", False),
+                final_strategy=result.get("healing", {}).get("final_strategy"),
+                healing_strategy=result.get("healing", {}).get("healing_strategy"),
+                retry_count=result.get("healing", {}).get("retry_count", 0),
+                initial_failure_reason=result.get("healing", {}).get("initial_failure_reason", ""),
+                healing_success=result.get("healing", {}).get("healing_success", False),
+                attempts=[
+                    HealingAttemptInfo(**a)
+                    for a in result.get("healing", {}).get("attempts", [])
+                ],
+            ),
+            metadata=MetadataInfo(
+                total_time_s=result.get("metadata", {}).get("total_time_s", 0.0),
+                healing_time_s=result.get("metadata", {}).get("healing_time_s", 0.0),
+            ),
+            # Root level fields (Issue 5)
+            healing_attempted=result.get("healing_attempted", False),
+            healing_strategy=result.get("healing_strategy"),
+            retry_count=result.get("retry_count", 0),
+            initial_failure_reason=result.get("initial_failure_reason", ""),
+            final_decision=result.get("final_decision", "FAIL"),
+            healing_success=result.get("healing_success", False),
         )
-        
+
     except Exception as e:
-        logger.error(f"Error occurred during RAG ask flow for query '{request.question}': {e}", exc_info=True)
+        logger.error(
+            f"Error occurred during RAG ask flow for query '{request.question}': {e}",
+            exc_info=True,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal RAG processing error."

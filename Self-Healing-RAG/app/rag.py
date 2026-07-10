@@ -24,6 +24,9 @@ from langchain_community.document_loaders import PyPDFLoader, TextLoader
 # Critic Agent Imports
 from critic import CriticAgent
 
+# Healing Controller Imports
+from healing import HealingController
+
 # Configure logging format
 logging.basicConfig(
     level=logging.INFO,
@@ -105,7 +108,10 @@ class SelfHealingRAG:
         # 6. Initialize Critic Agent
         self.critic = CriticAgent(llm=self.llm)
 
-        # 7. Auto build/update vector store on startup
+        # 7. Initialize Healing Controller
+        self.healing_controller = HealingController(rag=self, llm=self.llm)
+
+        # 8. Auto build/update vector store on startup
         self.build_or_update_vectorstore()
         logger.info("Self-Healing RAG initialization complete.")
 
@@ -579,34 +585,238 @@ class SelfHealingRAG:
     def evaluate_response(self) -> None:
         """
         Placeholder for response evaluation.
-        # TODO: Integrate Critic Agent
-        # TODO: Integrate Hallucination Detection
+        Evaluation is handled exclusively by CriticAgent.
         """
         pass
 
     def verify_retrieval_quality(self) -> None:
         """
         Placeholder for retrieval quality verification.
-        # TODO: Integrate Retrieval Verification
-        # TODO: Integrate Self-Healing Retry Logic
+        Healing and retry logic are handled by HealingController.
         """
         pass
 
+    # ------------------------------------------------------------------
+    # V3 Internal Methods — used exclusively by RetryOrchestrator
+    # ------------------------------------------------------------------
+
+    def _retrieve_with_context(
+        self, retry_ctx: "healing.models.RetryContext"
+    ) -> dict[str, Any]:
+        """
+        Internal retrieval that respects all RetryContext parameters.
+
+        Differences from retrieve_context():
+          - Uses rewritten_query if set, otherwise falls back to question.
+          - Respects retry_ctx.retrieval_k and fetch_k.
+          - Filters out chunk IDs listed in excluded_chunk_ids.
+
+        This method is called ONLY by RetryOrchestrator. The public
+        retrieve_context() is never modified.
+        """
+        from healing.models import RetryContext  # local import avoids circular dep at module level
+
+        query = retry_ctx.rewritten_query or retry_ctx.question
+        logger.info(
+            "[Healing] _retrieve_with_context: query='%s' k=%d fetch_k=%d exclusions=%d",
+            query,
+            retry_ctx.retrieval_k,
+            retry_ctx.fetch_k,
+            len(retry_ctx.excluded_chunk_ids),
+        )
+
+        try:
+            docs = self.vectorstore.max_marginal_relevance_search(
+                query=query,
+                k=retry_ctx.retrieval_k,
+                fetch_k=retry_ctx.fetch_k,
+            )
+        except Exception as exc:
+            logger.error("[Healing] _retrieve_with_context failed: %s", exc)
+            raise
+
+        # Exclude flagged chunks (PROMPT_INJECTION strategy)
+        if retry_ctx.excluded_chunk_ids:
+            excluded_set = set(retry_ctx.excluded_chunk_ids)
+            docs = [
+                doc for doc in docs
+                if doc.metadata.get("chunk_id") not in excluded_set
+            ]
+
+        scores = self._get_relevance_scores(query, docs)
+        sources = list({
+            doc.metadata.get("source_file", "")
+            for doc in docs
+            if doc.metadata.get("source_file")
+        })
+
+        return {
+            "documents": docs,
+            "relevance_scores": scores,
+            "sources": sources,
+        }
+
+    # Strict grounding system prompt — injected when HALLUCINATION strategy is active
+    _STRICT_SYSTEM_PROMPT: str = (
+        "You are an enterprise document assistant operating in STRICT GROUNDING mode.\n\n"
+        "Rules:\n"
+        "1. Answer ONLY from the supplied document context.\n"
+        "2. Every factual claim MUST be directly traceable to verbatim text in the context.\n"
+        "3. Do NOT infer, extrapolate, or assume anything beyond what is explicitly stated.\n"
+        "4. Do NOT use outside knowledge under any circumstances.\n"
+        "5. If the context does not contain a direct answer, respond exactly:\n"
+        '   "I could not find sufficient information in the uploaded documents."\n'
+        "6. Cite the source filename for every factual claim."
+    )
+
+    def _generate_with_context(
+        self,
+        question: str,
+        retry_ctx: "healing.models.RetryContext",
+        context_text: str,
+    ) -> str:
+        """
+        Internal generation that optionally applies the strict grounding prompt.
+
+        When retry_ctx.use_strict_grounding is True (HALLUCINATION strategy),
+        a stricter system prompt is injected to suppress hallucination.
+        Otherwise, the standard system prompt is used.
+
+        This method is called ONLY by RetryOrchestrator. The public
+        generate_answer() is never modified.
+        """
+        if retry_ctx.use_strict_grounding:
+            system_prompt = self._STRICT_SYSTEM_PROMPT
+            logger.info("[Healing] _generate_with_context: using STRICT grounding prompt.")
+        else:
+            system_prompt = (
+                "You are an enterprise document assistant.\n\n"
+                "Rules:\n"
+                "1. Answer ONLY from the supplied document context.\n"
+                "2. Never use outside knowledge.\n"
+                "3. Never hallucinate.\n"
+                "4. Never make assumptions.\n"
+                "5. If information is not found in the supplied documents, respond exactly:\n"
+                '   "I could not find sufficient information in the uploaded documents."\n'
+                "6. Cite source filenames used for the answer.\n"
+                "7. If context is weak or uncertain, return the exact fallback response above."
+            )
+            logger.info("[Healing] _generate_with_context: using standard prompt.")
+
+        try:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {question}"},
+            ]
+            response = self.llm.invoke(messages)
+            answer = response.content.strip()
+            logger.info("[Healing] _generate_with_context: answer generated.")
+            return answer
+        except Exception as exc:
+            logger.error("[Healing] _generate_with_context failed: %s", exc)
+            raise
+
     def ask(self, question: str) -> dict[str, Any]:
         """
-        Executes the full RAG query flow.
-        Retrieves context, validates relevance, generates answer, and formats response.
+        Executes the full V3 RAG query flow:
+          Retrieve → Generate → Critic → (if FAIL) HealingController.
+
+        Returns an enriched response envelope containing the final answer,
+        pipeline status, critic evaluation summary, healing metadata, and
+        timing information. Internal prompts and chain-of-thought are never
+        included in the returned dict.
         """
-        logger.info(f"Startup: Querying: '{question}'")
-        
-        # 1. Retrieve context
+        logger.info("Startup: Querying: '%s'", question)
+        total_start = time.time()
+
+        fallback_answer = (
+            "I could not find sufficient information in the uploaded documents."
+        )
+
+        def _build_response(
+            answer: str,
+            status: str,
+            sources: list[str],
+            retrieved_chunks: int,
+            critic_res: dict[str, Any],
+            healing_result: Any = None,
+            total_time: float = 0.0,
+        ) -> dict[str, Any]:
+            """Assemble the enriched response envelope."""
+            healing_time = (
+                healing_result.total_healing_time_s if healing_result else 0.0
+            )
+            
+            # Extract healing metadata fields (Issue 5)
+            healing_attempted = healing_result.healing_attempted if healing_result else False
+            retry_count = healing_result.retry_count if healing_result else 0
+            initial_failure_reason = healing_result.initial_failure_reason if healing_result else (
+                critic_res.get("failure_reason") if status == "FAIL" else "NONE"
+            )
+            final_strategy = (
+                healing_result.final_strategy.value
+                if healing_result and healing_result.final_strategy
+                else None
+            )
+            healing_strategy = final_strategy
+            final_decision = critic_res.get("decision", "FAIL" if status == "FAIL" else "PASS")
+            healing_success = healing_result.healing_success if healing_result else False
+            
+            healing_payload: dict[str, Any] = {
+                "healing_attempted": healing_attempted,
+                "final_strategy": final_strategy,
+                "healing_strategy": healing_strategy,
+                "retry_count": retry_count,
+                "initial_failure_reason": initial_failure_reason,
+                "healing_success": healing_success,
+                "attempts": [
+                    a.model_dump() for a in healing_result.attempts
+                ] if healing_result else [],
+            }
+            critic_summary = {
+                "decision": final_decision,
+                "failure_reason": critic_res.get("failure_reason"),
+                "grounded_score": critic_res.get("grounded_score"),
+                "relevance_score": critic_res.get("relevance_score"),
+                "hallucination_score": critic_res.get("hallucination_score"),
+                "overall_confidence": critic_res.get("overall_confidence"),
+                "reason": critic_res.get("reason"),
+            }
+            
+            response_dict = {
+                "question": question,
+                "answer": answer,
+                "status": status,
+                "sources": sorted(sources),
+                "retrieved_chunks": retrieved_chunks,
+                "critic_evaluation": critic_summary,
+                "healing": healing_payload,
+                "metadata": {
+                    "total_time_s": round(total_time, 4),
+                    "healing_time_s": round(healing_time, 4),
+                },
+                # Root level fields (Issue 5)
+                "healing_attempted": healing_attempted,
+                "healing_strategy": healing_strategy,
+                "retry_count": retry_count,
+                "initial_failure_reason": initial_failure_reason,
+                "final_decision": final_decision,
+                "healing_success": healing_success,
+            }
+            
+            logger.info(f"[Self-Healing RAG] Final Response: {answer}")
+            return response_dict
+
+        # ── 1. Retrieve context ───────────────────────────────────────────
+        logger.info(f"[Self-Healing RAG] Question: {question}")
+        logger.info("[Self-Healing RAG] Retrieval: Retrieving context...")
         retrieval_res = self.retrieve_context(question)
         docs = retrieval_res["documents"]
         scores = retrieval_res["relevance_scores"]
 
-        # 2. Filter relevance scores
+        # ── 2. Filter by relevance threshold ─────────────────────────────
         filtered_docs = []
-        filtered_sources = set()
+        filtered_sources: set[str] = set()
 
         for doc, score in zip(docs, scores):
             if score >= self.min_relevance_score:
@@ -616,70 +826,120 @@ class SelfHealingRAG:
                     filtered_sources.add(source_file)
             else:
                 logger.info(
-                    f"Filtered out chunk {doc.metadata.get('chunk_id')} "
-                    f"with relevance score {score:.4f} (below threshold {self.min_relevance_score})"
+                    "Filtered out chunk %s with relevance score %.4f "
+                    "(below threshold %.2f)",
+                    doc.metadata.get("chunk_id"),
+                    score,
+                    self.min_relevance_score,
                 )
 
-        fallback_answer = "I could not find sufficient information in the uploaded documents."
+        logger.info(f"[Self-Healing RAG] Retrieval: Retrieved {len(filtered_docs)} chunks")
 
-        # Verify answer validation triggers
+        # ── Empty context fast-path ───────────────────────────────────────
         if not docs or not filtered_docs:
-            logger.warning("No documents retrieved or all chunks are below the relevance threshold.")
+            logger.warning(
+                "No documents retrieved or all chunks below relevance threshold."
+            )
             critic_res = self.critic.evaluate(question, "", fallback_answer)
-            return {
-                "question": question,
-                "answer": fallback_answer,
-                "sources": [],
-                "retrieved_chunks": 0,
-                "critic_evaluation": critic_res
-            }
+            total_time = time.time() - total_start
+            return _build_response(
+                answer=fallback_answer,
+                status="FAIL",
+                sources=[],
+                retrieved_chunks=0,
+                critic_res=critic_res,
+                total_time=total_time,
+            )
 
         context_text = "\n\n".join(doc.page_content for doc in filtered_docs)
         if not context_text.strip():
             logger.warning("Retrieved context content is empty.")
             critic_res = self.critic.evaluate(question, "", fallback_answer)
-            return {
-                "question": question,
-                "answer": fallback_answer,
-                "sources": [],
-                "retrieved_chunks": 0,
-                "critic_evaluation": critic_res
-            }
+            total_time = time.time() - total_start
+            return _build_response(
+                answer=fallback_answer,
+                status="FAIL",
+                sources=[],
+                retrieved_chunks=0,
+                critic_res=critic_res,
+                total_time=total_time,
+            )
 
-        # 3. Generate response using LLM
+        # ── 3. Generate ───────────────────────────────────────────────────
+        logger.info("[Self-Healing RAG] Generation: Generating initial answer...")
         try:
             answer = self.generate_answer(question, context_text)
-            
-            # 4. Evaluate generated response using Critic Agent
-            critic_res = self.critic.evaluate(question, context_text, answer)
-            
-            return {
-                "question": question,
-                "answer": answer,
-                "sources": sorted(list(filtered_sources)),
-                "retrieved_chunks": len(filtered_docs),
-                "critic_evaluation": critic_res
-            }
-        except Exception as e:
-            logger.error(f"Error handling LLM invocation: {e}")
-            # Map exception fallback to Critic failing criteria
+            logger.info("[Self-Healing RAG] Generation: Generated initial answer")
+        except Exception as exc:
+            logger.error("Error during LLM generation: %s", exc)
             fallback_critic = {
-                "grounded": False,
-                "relevant": False,
-                "complete": False,
-                "hallucination": False,
-                "prompt_injection": False,
-                "confidence": 0.0,
                 "decision": "FAIL",
-                "reason": f"Generation failed due to error: {e}"
+                "failure_reason": "UNKNOWN",
+                "reason": f"Generation failed: {exc}",
             }
-            return {
-                "question": question,
-                "answer": fallback_answer,
-                "sources": [],
-                "retrieved_chunks": 0,
-                "critic_evaluation": fallback_critic
-            }
+            total_time = time.time() - total_start
+            return _build_response(
+                answer=fallback_answer,
+                status="FAIL",
+                sources=[],
+                retrieved_chunks=0,
+                critic_res=fallback_critic,
+                total_time=total_time,
+            )
+
+        # ── 4. Critic evaluation ──────────────────────────────────────────
+        logger.info("[Self-Healing RAG] Critic: Evaluating response...")
+        critic_res = self.critic.evaluate(question, context_text, answer)
+        logger.info(f"[Self-Healing RAG] Critic evaluation: {critic_res.get('decision')} (Reason: {critic_res.get('failure_reason')})")
+
+        # ── 5. PASS — return immediately without healing ──────────────────
+        if critic_res.get("decision") != "FAIL":
+            total_time = time.time() - total_start
+            return _build_response(
+                answer=answer,
+                status="PASS",
+                sources=list(filtered_sources),
+                retrieved_chunks=len(filtered_docs),
+                critic_res=critic_res,
+                total_time=total_time,
+            )
+
+        # ── 6. FAIL — delegate to HealingController ───────────────────────
+        logger.info(
+            f"[Self-Healing RAG] Healing Strategy Selected: {critic_res.get('failure_reason')}"
+        )
+
+        try:
+            healing_result = self.healing_controller.run(
+                question=question,
+                initial_critic_result=critic_res,
+                initial_answer=answer,
+                initial_sources=sorted(list(filtered_sources)),
+                initial_chunks=len(filtered_docs),
+                initial_docs=filtered_docs,
+            )
+        except Exception as exc:
+            logger.error("HealingController raised an unexpected error: %s", exc)
+            total_time = time.time() - total_start
+            return _build_response(
+                answer=answer,
+                status="FAIL",
+                sources=list(filtered_sources),
+                retrieved_chunks=len(filtered_docs),
+                critic_res=critic_res,
+                total_time=total_time,
+            )
+
+        total_time = time.time() - total_start
+        return _build_response(
+            answer=healing_result.final_answer,
+            status=healing_result.status,
+            sources=healing_result.sources,
+            retrieved_chunks=healing_result.retrieved_chunks,
+            critic_res=healing_result.final_critic_evaluation,
+            healing_result=healing_result,
+            total_time=total_time,
+        )
 
 
 if __name__ == "__main__":
