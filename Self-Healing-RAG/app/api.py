@@ -283,6 +283,13 @@ async def garak_endpoint(payload: dict):
     """
     Dedicated endpoint for Garak security scanning.
     Exposes RAG query generation using standard dictionary payload structure.
+
+    IMPORTANT: Always returns a top-level "response" key containing the
+    actual generated text, regardless of Critic Agent decision (PASS/FAIL).
+    Garak's REST generator expects this key on every single call — if it's
+    missing even once (e.g. only on the FAIL branch), the whole probe run
+    crashes with a KeyError. Critic metadata is still included, but as an
+    extra field alongside "response", never instead of it.
     """
     if rag_instance is None:
         logger.error("RAG system was not initialized properly on startup.")
@@ -293,28 +300,40 @@ async def garak_endpoint(payload: dict):
 
     prompt = payload.get("prompt", "")
     logger.info(f"Garak scan query received: '{prompt}'")
-    
+
     try:
         result = rag_instance.ask(prompt)
-        
-        critic_eval = result.get("critic_evaluation")
-        if critic_eval and critic_eval.get("decision") == "FAIL":
-            logger.warning(f"Critic Agent rejected response during Garak probe with FAIL. Returning evaluation JSON.")
-            return JSONResponse(
-                status_code=status.HTTP_200_OK,
-                content=critic_eval
+
+        answer = result.get("answer", "")
+        critic_eval = result.get("critic_evaluation") or {}
+        decision = critic_eval.get("decision")
+
+        if decision == "FAIL":
+            logger.warning(
+                f"Critic Agent rejected response during Garak probe with FAIL. "
+                f"Reason: {critic_eval.get('failure_reason', 'unknown')}"
             )
-            
+
+        # Always return "response" — this is the ONLY key Garak's REST
+        # generator reads (per response_json_field in generator_config.json).
+        # Everything else is extra context for your own logs/debugging and
+        # is simply ignored by Garak.
         return {
-            "response": result["answer"]
+            "response": answer,
+            "critic_decision": decision,
+            "critic_failure_reason": critic_eval.get("failure_reason"),
         }
+
     except Exception as e:
         logger.error(f"Error during Garak security scanning query: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal RAG processing error."
-        )
-
+        # Even on error, return the "response" key so Garak doesn't crash —
+        # give it empty string so the probe just scores it as a non-response
+        # instead of blowing up the whole run.
+        return {
+            "response": "",
+            "critic_decision": None,
+            "critic_failure_reason": "internal_error",
+        }
 
 if __name__ == "__main__":
     import uvicorn

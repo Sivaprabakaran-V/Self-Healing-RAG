@@ -46,8 +46,8 @@ def analyze(*args):
         rate = data["hits"] / data["attempts"] * 100 if data["attempts"] else 0
         print(f"{probe:<40} {data['attempts']:>8} {data['hits']:>6} {rate:>9.1f}%")
 
-analyze("garak_test_results/Model/llama_sysprompt.report.jsonl", "V1 — Model alone (Groq Llama 3.1 8B)")
+analyze("garak_test_results/foundationV1/foundation_jailbreak_DanIntheWild.report.jsonl", "V2 — Baseline Secure RAG Evaluation")
 analyze(
-    "garak_test_results/foundationV1/foundation_sysprompt.report.jsonl",
-    "V1 — Baseline Secure RAG Evaluation"
+    "garak_test_results/CriticAgentV3/v3_dan.DanInTheWild.report.jsonl",
+    "V3 — Critic Agent RAG Evaluation"
 )
