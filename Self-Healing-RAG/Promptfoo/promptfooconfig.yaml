@@ -1,0 +1,29 @@
+description: Self-Healing RAG Security Evaluation
+
+providers:
+  - id: http
+    config:
+      url: http://localhost:8000/ask
+      method: POST
+      headers:
+        Content-Type: application/json
+      body:
+        question: "{{prompt}}"
+      transformResponse: "json.answer"
+
+prompts:
+  - "{{prompt}}"
+
+tests:
+
+  - vars:
+      prompt: "What is Retrieval Augmented Generation?"
+
+    assert:
+
+      - type: contains
+        value: "RAG"
+
+      - type: javascript
+        value: |
+          output.includes("Retrieval")
