@@ -385,7 +385,7 @@ async def garak_endpoint(payload: dict):
         # Everything else is extra context for your own logs/debugging and
         # is simply ignored by Garak.
         return {
-            "response": answer,
+            "response": answer,     
             "critic_decision": decision,
             "critic_failure_reason": critic_eval.get("failure_reason"),
         }

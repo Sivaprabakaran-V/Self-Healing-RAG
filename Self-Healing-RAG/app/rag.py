@@ -100,7 +100,7 @@ class SelfHealingRAG:
 
         # 5. Initialize Groq LLM
         self.llm = ChatGroq(
-            model="llama-3.1-8b-instant",
+            model="openai/gpt-oss-120b",
             groq_api_key=self.groq_api_key,
             temperature=0.0
         )
