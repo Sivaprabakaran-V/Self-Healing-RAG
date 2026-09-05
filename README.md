@@ -67,6 +67,21 @@ Garak's raw results on V3 initially showed a 99.6% hit rate on one probe (`donot
 
 This is why Promptfoo was brought in as a second, independently-built evaluation framework for V3 rather than trusting Garak's numbers alone — full writeup in `reports/v3/v3_garak_analysis_report.md`.
 
+## Finding the code and reports for each version
+
+This branch (`main`) only holds reports and documentation — **all code lives in its own version branch.** To look at a specific version:
+
+| Want to see... | Go to |
+|---|---|
+| V1 code (baseline RAG, no security controls) | [`v1-foundation`](../../tree/v1-foundation) branch |
+| V2 code (adds the Critic Agent) | [`v2-critic-agent`](../../tree/v2-critic-agent) branch |
+| V3 code (adds the Healing Controller) | [`v3-self-healing`](../../tree/v3-self-healing) branch |
+| Any version's report | Stays here on `main`, under `reports/v1/` or `reports/v3/` (see table below) — no need to switch branches to read a report |
+
+Each version branch also keeps its own copy of that version's report and raw test results alongside its code, so a branch is a complete, self-contained snapshot of what existed at that stage — you don't need `main` to understand any single version in isolation.
+
+To switch branches on GitHub: use the branch dropdown (next to the file list, currently showing "main") and pick the version you want, or go directly via the links in the table above.
+
 ## Reports
 
 | Report | Version | Contents |
